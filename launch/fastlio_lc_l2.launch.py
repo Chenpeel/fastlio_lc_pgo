@@ -188,7 +188,7 @@ def generate_launch_description():
         'map_save_filter_size', default_value='0.05',
         description='Voxel leaf size (m) for the map_batch.pcd written by '
                     '/pgo_batch_optimize -- the localization PRIOR that '
-                    'lio_localization ICPs against, so denser is better. '
+                    'the localization stack is built from, so denser is better. '
                     'Independent of mapviz_filter_size so a dense prior does '
                     'not also make the RViz map heavy. <=0 means "same as '
                     'mapviz_filter_size".'
