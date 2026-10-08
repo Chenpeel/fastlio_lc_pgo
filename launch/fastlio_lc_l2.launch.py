@@ -7,9 +7,8 @@
 #   pgo_map_odom_bridge  map -> pgo_init -> lio_init, and the upright 'map'
 #   octomap_server       ray-traced 2D grid on /projected_map (occupancy:=true)
 #
-# Nothing is written until you call
-#   ros2 service call /pgo_batch_optimize std_srvs/srv/Trigger
-# which saves map_pcd_path plus optimized_poses.txt under save_directory.
+# Keyframes and pose/time logs are written during mapping. After stopping,
+# call /pgo_batch_optimize while PGO is running to save the final map.
 
 import os
 from typing import List
@@ -41,12 +40,12 @@ def generate_launch_description():
     declare_save_directory_cmd = DeclareLaunchArgument(
         'save_directory',
         default_value=os.path.expanduser('~/Lidar/run_l2_lc/pgo_output/'),
-        description='Directory where PGO writes optimized poses, odom poses, times and keyframe scans (its Scans/ subfolder is wiped on startup)'
+        description='New or empty session directory for optimized poses, times and keyframe scans; nonempty directories are rejected'
     )
 
-    # Kept out of save_directory, which is scratch: this node wipes
-    # <save_directory>/Scans at startup. Writes to the SOURCE tree so the map
-    # survives a rebuild and pepper_navigation installs it from pcd/. Assumes
+    # Separate the map deliverable from the per-session keyframes and logs.
+    # This legacy example writes to the SOURCE tree so pepper_navigation
+    # installs it from pcd/. Assumes
     # the workspace is at ~/ros2_ws; pass the argument if it is not.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',

@@ -4,8 +4,8 @@
 #   * Only odom_topic needs repointing. pgo_node's topics are plain parameters
 #     and Point-LIO's /cloud_registered_body is named identically to FAST-LIO's,
 #     so the swap needs no PGO or GTSAM source changes.
-#   * save_directory defaults SEPARATELY, because PGO wipes its Scans/ on
-#     startup and a shared directory would let one backend destroy the other's.
+#   * Each backend needs a separate new or empty save_directory.
+#     PGO rejects nonempty session directories and never erases previous runs.
 #
 #   ros2 launch fastlio_lc_pgo pointlio_lc_l2.launch.py
 #   ros2 bag play <bag> --clock --topics /points /imu/data /tf /tf_static
@@ -41,14 +41,13 @@ def generate_launch_description():
         'save_directory',
         default_value=os.path.expanduser('~/Lidar/run_l2_lc_pointlio/pgo_output/'),
         description='Directory where PGO writes optimized poses, odom poses, times and '
-                    'keyframe scans (its Scans/ subfolder is wiped on startup). Kept '
-                    'separate from fastlio_lc_l2.launch.py\'s default so the two '
-                    'backends cannot wipe each other\'s saved runs.'
+                    'keyframe scans. Must be new or empty; nonempty sessions are '
+                    'rejected. Keep separate from the FAST-LIO output directory.'
     )
 
-    # Kept out of save_directory, which is scratch: this node wipes
-    # <save_directory>/Scans at startup. Writes to the SOURCE tree so the map
-    # survives a rebuild and pepper_navigation installs it from pcd/. Assumes
+    # Separate the map deliverable from the per-session keyframes and logs.
+    # This legacy example writes to the SOURCE tree so pepper_navigation
+    # installs it from pcd/. Assumes
     # the workspace is at ~/ros2_ws; pass the argument if it is not.
     declare_map_pcd_path_cmd = DeclareLaunchArgument(
         'map_pcd_path',

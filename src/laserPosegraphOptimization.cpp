@@ -22,7 +22,8 @@
 #include <iostream>
 #include <string>
 #include <optional>
-#include <filesystem>   // save_directory handling, replacing system("rm -r")
+#include <stdexcept>
+#include <filesystem>
 #include <cstdlib>      // getenv, for the save_directory default
 
 #include <pcl/point_cloud.h>
@@ -89,13 +90,7 @@ using std::endl;
 
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
-double translationAccumulated = 1000000.0; // large value means must add the first given frame.
-double rotaionAccumulated = 1000000.0; // large value means must add the first given frame.
-
 bool isNowKeyFrame = false;
-
-Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0}; // init
-Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0}; // init pose is zero
 
 std::queue<nav_msgs::msg::Odometry::SharedPtr> odometryBuf;
 std::queue<sensor_msgs::msg::PointCloud2::SharedPtr> fullResBuf;
@@ -191,14 +186,9 @@ rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srvBatchOptimize;
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
 std::string odomKITTIformat;
-// Full path of the assembled map written by /pgo_batch_optimize. Kept SEPARATE
-// from save_directory on purpose: save_directory is scratch -- this node wipes
-// <save_directory>/Scans recursively at startup and fills it with one .pcd per
-// keyframe plus three pose/time logs -- whereas the finished map is a
-// deliverable that belongs beside the 2D grid it must share a frame with
-// (pepper_navigation/map). Pointing save_directory itself at the map directory
-// would dump ~1000 scratch files into it and wipe a Scans/ subfolder there.
-// Empty means "save_directory + map_batch.pcd", i.e. the historical behaviour.
+// The finished map may live separately from the per-session keyframes and logs.
+// save_directory must be new or empty; startup never removes previous results.
+// Empty map_pcd_path means "save_directory + map_batch.pcd".
 std::string map_pcd_path;
 // World frame all PGO outputs (map, path, odom, loop markers, TF parent) are
 // stamped in. Mirrors FAST-LIO's publish.map_frame parameter: defaults to the
@@ -560,7 +550,8 @@ void updatePoses(void)
     recentOptimizedX = lastOptimizedPose.translation().x();
     recentOptimizedY = lastOptimizedPose.translation().y();
 
-    recentIdxUpdated = int(keyframePosesUpdated.size()) - 1;
+    // Consumers use an exclusive upper bound; include every optimized pose.
+    recentIdxUpdated = static_cast<int>(isamCurrentEstimate.size());
 
     mtxRecentPose.unlock();
 } // updatePoses
@@ -788,24 +779,19 @@ void process_pg()
             }
             mBuf.unlock();
 
-            //
-            // Early reject by counting local delta movement (for equi-sperated kf drop)
-            //
-            odom_pose_prev = odom_pose_curr;
-            odom_pose_curr = pose_curr;
-            Pose6D dtf = diffTransformation(odom_pose_prev, odom_pose_curr); // dtf means delta_transform
-
-            double delta_translation = sqrt(dtf.x*dtf.x + dtf.y*dtf.y + dtf.z*dtf.z); // note: absolute value.
-            translationAccumulated += delta_translation;
-            rotaionAccumulated += (dtf.roll + dtf.pitch + dtf.yaw); // sum just naive approach.
-
-            // keyframe selection
-            if( translationAccumulated > keyframeMeterGap || rotaionAccumulated > keyframeRadGap ) {
+            // Compare against the last accepted keyframe. Do not accumulate
+            // stationary estimator jitter into artificial motion.
+            if (keyframePoses.empty()) {
                 isNowKeyFrame = true;
-                translationAccumulated = 0.0; // reset
-                rotaionAccumulated = 0.0; // reset
             } else {
-                isNowKeyFrame = false;
+                const Pose6D dtf = diffTransformation(keyframePoses.back(), pose_curr);
+                const double delta_translation =
+                    std::sqrt(dtf.x * dtf.x + dtf.y * dtf.y + dtf.z * dtf.z);
+                const double delta_rotation =
+                    std::sqrt(dtf.roll * dtf.roll + dtf.pitch * dtf.pitch +
+                              dtf.yaw * dtf.yaw);
+                isNowKeyFrame = delta_translation >= keyframeMeterGap ||
+                                delta_rotation >= keyframeRadGap;
             }
 
             if( ! isNowKeyFrame )
@@ -1387,22 +1373,24 @@ int main(int argc, char **argv)
 	g_tf_buffer = std::make_shared<tf2_ros::Buffer>(g_node->get_clock());
 	g_tf_listener = std::make_shared<tf2_ros::TransformListener>(*g_tf_buffer);
 
-    // LOCAL FIX: default was "/". Combined with the rm -r below that meant a
-    // bare `ros2 run` (no launch file to override it) would try to delete
-    // /Scans/ and write pose logs into the filesystem root. Defaulting under
-    // the user's cache directory makes the unconfigured case harmless.
+    // Keep the default outside the source tree. Reusing a completed session
+    // is rejected below instead of silently erasing its keyframes.
     {
         const char *home = std::getenv("HOME");
         std::string default_save = std::string(home ? home : "/tmp") + "/.cache/fastlio_lc_pgo/";
         g_node->declare_parameter<std::string>("save_directory", default_save);
     }
     save_directory = g_node->get_parameter("save_directory").as_string();
-    if (save_directory.empty() || save_directory == "/") {
-        RCLCPP_ERROR(g_node->get_logger(),
-            "save_directory '%s' refuses to be used: this node deletes "
-            "<save_directory>/Scans recursively at startup.", save_directory.c_str());
+    if (save_directory.empty()) {
+        RCLCPP_ERROR(g_node->get_logger(), "save_directory must not be empty");
         return 1;
     }
+    const auto save_root = std::filesystem::absolute(save_directory).lexically_normal();
+    if (save_root == save_root.root_path()) {
+        RCLCPP_ERROR(g_node->get_logger(), "save_directory must not resolve to the filesystem root");
+        return 1;
+    }
+    save_directory = save_root.string();
     if (save_directory.back() != '/') save_directory += '/';
 
     // World frame for all published outputs (see map_frame declaration above).
@@ -1466,23 +1454,27 @@ int main(int argc, char **argv)
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgScansDirectory = save_directory + "Scans/";
-    // create the save directory (and wipe/recreate its Scans/ subfolder) before
-    // opening any output streams under it - times.txt lives directly in
-    // save_directory, so this must happen first or the open silently fails.
-    // LOCAL FIX: was an unquoted `system("exec rm -r " + pgScansDirectory)`, so
-    // any space or shell metacharacter in save_directory changed what got
-    // deleted. std::filesystem does the same job without a shell.
-    {
-        std::error_code ec;
-        std::filesystem::remove_all(pgScansDirectory, ec);
-        std::filesystem::create_directories(pgScansDirectory, ec);
-        if (ec) {
-            RCLCPP_ERROR(g_node->get_logger(), "Cannot create %s: %s",
-                         pgScansDirectory.c_str(), ec.message().c_str());
-            return 1;
+    // Never erase an earlier session. Existing directories must be empty.
+    try {
+        if (std::filesystem::exists(save_root) &&
+            (!std::filesystem::is_directory(save_root) ||
+             !std::filesystem::is_empty(save_root))) {
+            throw std::runtime_error("save_directory already contains a session; choose a new directory");
         }
+        std::filesystem::create_directories(save_root);
+        if (!std::filesystem::create_directory(pgScansDirectory)) {
+            throw std::runtime_error("Scans already exists; another process may own this session");
+        }
+    } catch (const std::exception &error) {
+        RCLCPP_ERROR(g_node->get_logger(), "Cannot prepare session %s: %s",
+                     save_directory.c_str(), error.what());
+        return 1;
     }
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out);
+    if (!pgTimeSaveStream) {
+        RCLCPP_ERROR(g_node->get_logger(), "Cannot open session time log");
+        return 1;
+    }
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
 
     g_node->declare_parameter<double>("keyframe_meter_gap", 2.0);
